@@ -1525,11 +1525,11 @@ function QuickAuditPage({showToast,onSaveLead}){
         {suggestions.length>0&&(
           <div style={{position:"absolute",top:"100%",left:0,right:80,background:"var(--white)",border:"1px solid var(--border)",borderRadius:8,boxShadow:"0 8px 24px rgba(0,0,0,0.12)",zIndex:100,marginTop:4,overflow:"hidden"}}>
             {suggestions.map((s,i)=>(
-              <button key={s.place_id||i} onClick={()=>pickSuggestion(s)} style={{display:"block",width:"100%",textAlign:"left",padding:"10px 14px",background:"transparent",borderBottom:i<suggestions.length-1?"1px solid var(--border)":"none",cursor:"pointer",transition:"background 0.1s"}}
+              <button key={s.placeId||s.place_id||i} onClick={()=>pickSuggestion(s)} style={{display:"block",width:"100%",textAlign:"left",padding:"10px 14px",background:"transparent",borderBottom:i<suggestions.length-1?"1px solid var(--border)":"none",cursor:"pointer",transition:"background 0.1s"}}
                 onMouseEnter={e=>e.currentTarget.style.background="var(--bg)"}
                 onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                <div style={{fontSize:13,fontWeight:500,color:"var(--text)"}}>{s.structured_formatting?.main_text||s.description}</div>
-                {s.structured_formatting?.secondary_text&&<div style={{fontSize:11,color:"var(--text2)",marginTop:2}}>{s.structured_formatting.secondary_text}</div>}
+                <div style={{fontSize:13,fontWeight:500,color:"var(--text)"}}>{s.text?.text||s.structuredFormat?.mainText?.text||s.structured_formatting?.main_text||s.description||""}</div>
+                {(s.structuredFormat?.secondaryText?.text||s.structured_formatting?.secondary_text)&&<div style={{fontSize:11,color:"var(--text2)",marginTop:2}}>{s.structuredFormat?.secondaryText?.text||s.structured_formatting?.secondary_text}</div>}
               </button>
             ))}
           </div>
