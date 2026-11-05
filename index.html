@@ -214,6 +214,52 @@ const EMBEDDED_GOOGLE_KEY="AIzaSyCqRG80kckH3Wnz_SpQigsQvgayVBGmGb8";
 
 const TERRITORIES=[];
 
+// Fill in any fields the UI expects so contacts from Territory scans, CSV, Quick Audit or old saves never crash a page
+function normalizeContact(c){
+  const n=v=>{const x=Number(v);return Number.isFinite(x)?Math.max(0,Math.min(100,Math.round(x))):0;};
+  const out={...c,
+    id:c.id??(Date.now()+Math.random()),
+    biz:c.biz||c.name||"Unknown Business",
+    title:c.title||"Owner",
+    email:c.email||"",phone:c.phone||"",
+    niche:c.niche||"General",location:c.location||"",
+    website:c.website||"",hasWeb:c.hasWeb??!!c.website,
+    status:c.status||"new",notes:c.notes||"",
+    auditData:c.auditData||null,
+    activity:Array.isArray(c.activity)?c.activity:[{type:"created",text:"Added"+(c.source?" from "+c.source:""),time:new Date().toLocaleString()}],
+  };
+  out.name=c.name||out.biz;
+  ["seo","reviews","social","ws","ads","listings","ecom","tech"].forEach(k=>out[k]=n(c[k]));
+  out.grade=c.grade&&GC[c.grade]?c.grade:s2g(ovr(out));
+  return out;
+}
+
+const getGoogleKey=()=>{try{return JSON.parse(localStorage.getItem("geni_keys")||"{}")["Google Places / PageSpeed API"]||EMBEDDED_GOOGLE_KEY;}catch{return EMBEDDED_GOOGLE_KEY;}};
+
+// Places API (New) Text Search — supports browser CORS (the legacy maps/api/place/* endpoints do not)
+async function placesTextSearch(key,textQuery,max=20){
+  const r=await fetch("https://places.googleapis.com/v1/places:searchText",{
+    method:"POST",
+    headers:{"Content-Type":"application/json","X-Goog-Api-Key":key,
+      "X-Goog-FieldMask":"places.id,places.displayName,places.formattedAddress,places.shortFormattedAddress,places.rating,places.userRatingCount,places.websiteUri,places.nationalPhoneNumber,places.regularOpeningHours,places.photos,places.googleMapsUri,places.businessStatus"},
+    body:JSON.stringify({textQuery,maxResultCount:max})
+  });
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(d.error?.message||("Places search failed ("+r.status+")"));
+  return d.places||[];
+}
+
+function downloadFile(name,text,type="text/csv"){
+  const url=URL.createObjectURL(new Blob([text],{type}));
+  const a=document.createElement("a");a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+async function copyText(t){
+  try{await navigator.clipboard.writeText(t);return true;}catch{
+    try{const ta=document.createElement("textarea");ta.value=t;document.body.appendChild(ta);ta.select();const ok=document.execCommand("copy");ta.remove();return ok;}catch{return false;}
+  }
+}
+
 // ── COMPONENTS ──────────────────────────────────────────────────────────────
 
 function Toast({toasts}){
@@ -514,7 +560,7 @@ function OutreachPanel({contact,toastFn}){
               <div style={{background:"var(--bg)",borderRadius:6,padding:"12px",margin:"4px 0 8px",border:"1px solid var(--border)"}}>
                 <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:"var(--text)",lineHeight:1.8,whiteSpace:"pre-wrap"}}>{c.script}</div>
                 <div style={{display:"flex",gap:8,marginTop:10}}>
-                  <button onClick={()=>toastFn("📋 Script copied for "+contact.name)} className="btn btn-secondary btn-sm">Copy Script</button>
+                  <button onClick={async()=>toastFn(await copyText(c.script)?"📋 Script copied for "+contact.name:"⚠️ Couldn't access clipboard — select the text and copy manually")} className="btn btn-secondary btn-sm">Copy Script</button>
                   <button onClick={()=>toastFn("🚀 "+c.name+" sent to "+contact.name)} className="btn btn-primary btn-sm">Send Now</button>
                 </div>
               </div>
@@ -545,30 +591,26 @@ function ContactRecord({contact,onBack,onUpdate,onDelete,toastFn}){
       const gKey=keys["Google Places / PageSpeed API"]||EMBEDDED_GOOGLE_KEY;
       const serpKey=keys["SerpAPI"]||"";
       let live={};
-      // ── Google Places API ──────────────────────────────────────────────────
+      // ── Google Places API (New) ─────────────────────────────────────────────
       if(gKey&&c.biz){
         try{
-          const enc=encodeURIComponent(c.biz+" "+c.location);
-          const fr=await fetch(`https://maps.googleapis.com/maps/api/place/findplacefromtext/json?input=${enc}&inputtype=textquery&fields=place_id,rating,user_ratings_total,website,business_status&key=${gKey}`);
-          if(fr.ok){
-            const fd=await fr.json();
-            const place=fd.candidates&&fd.candidates[0];
-            if(place){
-              live.googleRating=place.rating||0;
-              live.googleReviewCount=place.user_ratings_total||0;
-              live.hasWebFromGoogle=!!place.website;
-              if(place.place_id){
-                const dr=await fetch(`https://maps.googleapis.com/maps/api/place/details/json?place_id=${place.place_id}&fields=opening_hours,photos,formatted_phone_number&key=${gKey}`);
-                if(dr.ok){const dd=await dr.json();live.photoCount=(dd.result?.photos?.length||0);live.hasHours=!!(dd.result?.opening_hours);}
-              }
-            }
+          const place=(await placesTextSearch(gKey,c.biz+" "+(c.location||""),1))[0];
+          if(place){
+            live.found=true;
+            live.googleRating=place.rating||0;
+            live.googleReviewCount=place.userRatingCount||0;
+            live.websiteFromGoogle=place.websiteUri||"";
+            live.photoCount=place.photos?.length||0;
+            live.hasHours=!!place.regularOpeningHours;
+            live.phone=place.nationalPhoneNumber||"";
           }
-        }catch(e){/* Places failed — use local scores */}
+        }catch(e){console.warn("Places lookup failed:",e.message);}
       }
       // ── PageSpeed Insights API ──────────────────────────────────────────────
-      if(gKey&&(c.website||live.hasWebFromGoogle)){
+      const site=c.website||live.websiteFromGoogle;
+      if(gKey&&site){
         try{
-          const url=encodeURIComponent("https://"+(c.website||c.biz.toLowerCase().replace(/\s+/g,"")+".com"));
+          const url=encodeURIComponent(/^https?:\/\//i.test(site)?site:"https://"+site);
           const pr=await fetch(`https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${url}&strategy=mobile&key=${gKey}`);
           if(pr.ok){
             const pd=await pr.json();
@@ -586,9 +628,13 @@ function ContactRecord({contact,onBack,onUpdate,onDelete,toastFn}){
       }
       if(live.pageSpeed){enriched.ws=Math.round((live.pageSpeed*0.6)+(enriched.ws*0.4));}
       if(live.photoCount>3){enriched.listings=Math.min(100,enriched.listings+15);}
+      if(live.websiteFromGoogle&&!enriched.website){enriched.website=live.websiteFromGoogle;}
+      if(live.found){enriched.hasWeb=!!enriched.website;}
+      if(live.phone&&!enriched.phone){enriched.phone=live.phone;}
+      enriched.grade=s2g(ovr(enriched));
       const data=generateAuditLocally(enriched);
       // Attach live data notes to the audit
-      if(live.googleRating){
+      if(live.found){
         data.liveData={
           googleRating:live.googleRating,
           reviewCount:live.googleReviewCount,
@@ -598,9 +644,9 @@ function ContactRecord({contact,onBack,onUpdate,onDelete,toastFn}){
           dataSource:gKey?"Google Places + PageSpeed Insights":"Score-based estimate"
         };
       }
-      const updated={...c,...enriched,auditData:data,activity:[{type:"audit",text:"Live audit completed"+(live.googleRating?" (Google Places + PageSpeed)":""),time:"Just now"},...(c.activity||[])]};
+      const updated={...c,...enriched,auditData:data,activity:[{type:"audit",text:"Live audit completed"+(live.found?" (Google Places"+(live.pageSpeed?" + PageSpeed":"")+")":" (score-based — business not found on Google)"),time:new Date().toLocaleString()},...(c.activity||[])]};
       setC(updated);onUpdate(updated);
-      toastFn("✅ Audit complete for "+c.name+(live.googleRating?" — live data pulled":""));
+      toastFn("✅ Audit complete for "+c.biz+(live.found?" — live data pulled":" — no Google match, used existing scores"));
     }catch(e){console.error(e);toastFn("❌ Audit failed — check console");}
     setAuditing(false);
   };
@@ -610,6 +656,7 @@ function ContactRecord({contact,onBack,onUpdate,onDelete,toastFn}){
     const mkeys=["listings","reviews","social","ws","ecom","ads","seo","tech"];
     const mlabels={listings:"Listings",reviews:"Reviews",social:"Social Media",ws:"Website",ecom:"Ecommerce",ads:"Advertising",seo:"SEO",tech:"Technology"};
     const w=window.open("","_blank");
+    if(!w){toastFn("⚠️ Pop-up blocked — allow pop-ups for this site to export PDF");return;}
     w.document.write(`<!DOCTYPE html><html><head><title>${c.biz} Audit</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:Inter,sans-serif;color:#1a202c;background:#fff;padding:40px;max-width:860px;margin:0 auto}
@@ -797,7 +844,10 @@ function ContactRecord({contact,onBack,onUpdate,onDelete,toastFn}){
 
 // ── TERRITORY MAKER ──────────────────────────────────────────────────────────
 function TerritoryMaker({toastFn,onSelectContact,onImportContacts}){
-  const [territories,setTerritories]=useState(TERRITORIES);
+  const [territories,setTerritories]=useState(()=>{
+    try{const s=JSON.parse(localStorage.getItem("geni_territories")||"null");return Array.isArray(s)?s:TERRITORIES;}catch{return TERRITORIES;}
+  });
+  useEffect(()=>{try{localStorage.setItem("geni_territories",JSON.stringify(territories));}catch{}},[territories]);
   const [showNew,setShowNew]=useState(false);
   const [scanning,setScanning]=useState(null);
   const [scanStep,setScanStep]=useState(0);
@@ -812,57 +862,49 @@ function TerritoryMaker({toastFn,onSelectContact,onImportContacts}){
     setForm(f=>({...f,niches:arr}));
   };
 
-  const getKey=()=>{try{return JSON.parse(localStorage.getItem("geni_keys")||"{}")["Google Places / PageSpeed API"]||EMBEDDED_GOOGLE_KEY;}catch{return EMBEDDED_GOOGLE_KEY;}};
-
   const runScan=async(t)=>{
-    const key=getKey();
+    const key=getGoogleKey();
     if(!key){toastFn("⚠️ Add Google Places API key in Settings");return;}
     setScanning(t.id);setScanStep(1);
     try{
-      // Step 1: Geocode the area to get lat/lng
-      const geoQ=t.zip?t.zip:t.area;
-      const geoR=await fetch(`https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(geoQ)}&key=${key}`);
-      const geoD=await geoR.json();
-      if(!geoD.results?.length){toastFn("❌ Could not find location: "+geoQ);setScanning(null);return;}
-      const loc=geoD.results[0].geometry.location;
+      const where=t.zip?t.zip:t.area;
       setScanStep(2);
 
-      // Step 2: Search for each niche using Nearby Search
+      // Search each niche with Places API (New) Text Search — one call returns website, phone, hours and photos
       const allLeads=[];
       const seen=new Set();
+      let lastErr=null;
       for(const niche of t.niches){
         try{
-          const nr=await fetch(`https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${loc.lat},${loc.lng}&radius=8000&keyword=${encodeURIComponent(niche)}&type=establishment&key=${key}`);
-          const nd=await nr.json();
-          for(const p of (nd.results||[]).slice(0,20)){
-            if(seen.has(p.place_id))continue;
-            seen.add(p.place_id);
-            const hasWeb=!!(p.website);
-            // Get more details
-            let phone="",website="",hasWebDetail=hasWeb,hasHours=false;
-            try{
-              const dr=await fetch(`https://maps.googleapis.com/maps/api/place/details/json?place_id=${p.place_id}&fields=website,formatted_phone_number,opening_hours,business_status&key=${key}`);
-              const dd=await dr.json();
-              website=dd.result?.website||"";
-              phone=dd.result?.formatted_phone_number||"";
-              hasWebDetail=!!website;
-              hasHours=!!(dd.result?.opening_hours);
-            }catch{}
-            const reviewScore=p.user_ratings_total?Math.min(100,Math.round(p.user_ratings_total*1.2+(p.rating/5)*20)):10;
-            const listingScore=Math.min(100,(p.user_ratings_total?40:10)+(hasWebDetail?20:0)+(hasHours?15:0)+(p.photos?.length?15:0));
+          const places=await placesTextSearch(key,`${niche} in ${where}`,20);
+          for(const p of places){
+            if(seen.has(p.id))continue;
+            seen.add(p.id);
+            const website=p.websiteUri||"";
+            const hasWebDetail=!!website;
+            const hasHours=!!p.regularOpeningHours;
+            const rating=p.rating||0,count=p.userRatingCount||0,photos=p.photos?.length||0;
+            const reviewScore=count?Math.min(100,Math.round(count*1.2+(rating/5)*20)):10;
+            const listingScore=Math.min(100,(count?40:10)+(hasWebDetail?20:0)+(hasHours?15:0)+(photos?15:0));
             const wsScore=hasWebDetail?45:0;
-            const grade=s2g(Math.round(reviewScore*0.3+listingScore*0.25+wsScore*0.25+20*0.2));
-            allLeads.push({
-              id:p.place_id,biz:p.name,niche,phone,email:"",
-              location:p.vicinity||t.area,website,hasWeb:hasWebDetail,
-              rating:p.rating||0,reviewCount:p.user_ratings_total||0,
-              grade,seo:hasWebDetail?40:10,reviews:reviewScore,social:hasWebDetail?30:15,
+            const lead={
+              id:p.id,biz:p.displayName?.text||"Unknown",name:p.displayName?.text||"Unknown",title:"Owner",niche,
+              phone:p.nationalPhoneNumber||"",email:"",
+              location:p.shortFormattedAddress||p.formattedAddress||t.area,website,hasWeb:hasWebDetail,
+              rating,reviewCount:count,
+              seo:hasWebDetail?40:10,reviews:reviewScore,social:hasWebDetail?30:15,
               ws:wsScore,ads:hasWebDetail?20:5,listings:listingScore,ecom:hasWebDetail?15:0,tech:hasWebDetail?25:5,
-              status:"new",placeId:p.place_id,photoCount:p.photos?.length||0,hasHours,
-              mapsUrl:`https://www.google.com/maps/place/?q=place_id:${p.place_id}`
-            });
+              status:"new",placeId:p.id,photoCount:photos,hasHours,
+              mapsUrl:p.googleMapsUri||`https://www.google.com/maps/place/?q=place_id:${p.id}`
+            };
+            lead.grade=s2g(ovr(lead)); // same formula as the grade shown in the table
+            allLeads.push(lead);
           }
-        }catch(e){console.error("Niche search failed for",niche,e);}
+        }catch(e){lastErr=e;console.error("Niche search failed for",niche,e);}
+      }
+      if(!allLeads.length&&lastErr){
+        toastFn("❌ Google search failed: "+lastErr.message.slice(0,120));
+        setScanning(null);setScanStep(0);return;
       }
       setScanStep(3);
 
@@ -919,7 +961,7 @@ function TerritoryMaker({toastFn,onSelectContact,onImportContacts}){
               <option value="yes">Has website only</option>
             </select>
             <button className="btn btn-primary btn-sm" onClick={()=>runScan(terr)}>⚡ Re-Scan</button>
-            <button className="btn btn-secondary btn-sm" onClick={()=>{if(onImportContacts&&filteredLeads.length){const leads=filteredLeads.map(l=>({...l,id:Date.now()+Math.random(),status:"new",source:"Territory: "+terr.name}));onImportContacts(leads);toastFn("📥 "+leads.length+" leads imported to Contacts");}else{toastFn("⚠️ No leads to import");}}}>Import All</button>
+            <button className="btn btn-secondary btn-sm" onClick={()=>{if(onImportContacts&&filteredLeads.length){const leads=filteredLeads.map(l=>({...l,id:Date.now()+Math.random(),status:"new",source:"Territory: "+terr.name}));const added=onImportContacts(leads);toastFn(added?"📥 "+added+" leads imported to Contacts"+(added<leads.length?" ("+(leads.length-added)+" already there)":""):"ℹ️ All "+leads.length+" leads are already in Contacts");}else{toastFn("⚠️ No leads to import");}}}>Import All</button>
           </div>
         </div>
 
@@ -961,7 +1003,7 @@ function TerritoryMaker({toastFn,onSelectContact,onImportContacts}){
                         <td><SBar val={l.ads}/></td>
                         <td><Chip s={l.status||"new"}/></td>
                         <td>
-                          <button className="btn btn-primary btn-sm" onClick={()=>{if(onImportContacts){onImportContacts([{...l,id:Date.now()+Math.random(),status:"new",source:"Territory: "+terr.name}]);toastFn("📥 "+l.biz+" added to Contacts");}else{toastFn("📥 "+l.biz+" imported");}}}>Import</button>
+                          <button className="btn btn-primary btn-sm" onClick={()=>{if(onImportContacts){const added=onImportContacts([{...l,id:Date.now()+Math.random(),status:"new",source:"Territory: "+terr.name}]);toastFn(added?"📥 "+l.biz+" added to Contacts":"ℹ️ "+l.biz+" is already in Contacts");}else{toastFn("📥 "+l.biz+" imported");}}}>Import</button>
                         </td>
                       </tr>
                     );
@@ -1188,7 +1230,7 @@ function ContactsList({contacts,onSelect,toastFn,onImport}){
   const fileRef=useRef();
 
   const handleCSVFile=async(file)=>{
-    if(!file||!file.name.endsWith(".csv"))return toastFn("⚠️ Please upload a .csv file");
+    if(!file||!file.name.toLowerCase().endsWith(".csv"))return toastFn("⚠️ Please upload a .csv file");
     const text=await file.text();
     const rows=parseCSV(text);
     if(!rows.length)return toastFn("⚠️ No valid rows found in CSV");
@@ -1197,8 +1239,9 @@ function ContactsList({contacts,onSelect,toastFn,onImport}){
 
   const confirmImport=()=>{
     if(!csvPreview)return;
-    onImport(csvPreview.rows);
-    toastFn(`✅ ${csvPreview.rows.length} leads imported from ${csvPreview.filename}`);
+    const added=onImport(csvPreview.rows);
+    const skipped=csvPreview.rows.length-added;
+    toastFn(`✅ ${added} leads imported from ${csvPreview.filename}`+(skipped?` (${skipped} duplicates skipped)`:""));
     setCsvPreview(null);
   };
 
@@ -1209,8 +1252,9 @@ function ContactsList({contacts,onSelect,toastFn,onImport}){
   };
 
   const filtered=contacts.filter(c=>{
-    const ms=!search||c.name.toLowerCase().includes(search.toLowerCase())||c.biz.toLowerCase().includes(search.toLowerCase())||c.location.toLowerCase().includes(search.toLowerCase());
-    const mn=nicheF==="all"||c.niche.toLowerCase().includes(nicheF.toLowerCase());
+    const q=search.toLowerCase();
+    const ms=!q||[c.name,c.biz,c.location,c.email,c.phone].some(v=>(v||"").toLowerCase().includes(q));
+    const mn=nicheF==="all"||(c.niche||"").toLowerCase().includes(nicheF.toLowerCase());
     const mw=webF==="all"||(webF==="no"&&!c.hasWeb)||(webF==="yes"&&c.hasWeb);
     const mg=gradeF==="all"||c.grade===gradeF||(gradeF==="DF"&&(c.grade==="D"||c.grade==="F"));
     return ms&&mn&&mw&&mg;
@@ -1237,9 +1281,16 @@ function ContactsList({contacts,onSelect,toastFn,onImport}){
         </select>
         <span style={{fontSize:11,color:"var(--text2)"}}>{filtered.length} contacts</span>
         <div style={{marginLeft:"auto",display:"flex",gap:8}}>
-          <button className="btn btn-secondary btn-sm" onClick={()=>toastFn("📥 Exporting "+filtered.length+" contacts")}>↓ Export</button>
+          <button className="btn btn-secondary btn-sm" onClick={()=>{
+            if(!filtered.length)return toastFn("⚠️ No contacts to export");
+            const cols=["name","biz","title","email","phone","website","niche","location","grade","status","seo","reviews","social","ws","ads","listings","ecom","tech","rating","reviewCount","notes"];
+            const esc=v=>{const s=v==null?"":String(v);return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;};
+            const csv=[cols.join(","),...filtered.map(c=>cols.map(k=>esc(c[k])).join(","))].join("\n");
+            downloadFile(`geni-contacts-${new Date().toISOString().slice(0,10)}.csv`,csv);
+            toastFn("📥 Exported "+filtered.length+" contacts");
+          }}>↓ Export</button>
           <button className="btn btn-secondary btn-sm" onClick={()=>fileRef.current&&fileRef.current.click()}>📂 Import CSV</button>
-          <input ref={fileRef} type="file" accept=".csv" style={{display:"none"}} onChange={e=>e.target.files[0]&&handleCSVFile(e.target.files[0])}/>
+          <input ref={fileRef} type="file" accept=".csv" style={{display:"none"}} onChange={e=>{const f=e.target.files[0];e.target.value="";f&&handleCSVFile(f);}}/>
           <button className="btn btn-primary btn-sm" onClick={runScan}>⚡ Run Scan</button>
         </div>
       </div>
@@ -1435,28 +1486,19 @@ function QuickAuditPage({showToast,onSaveLead}){
     if(!q||q.length<2){setSuggestions([]);return;}
     setSearching(true);
     try{
-      // Attempt new Places API v1
-      const r=await fetch("https://places.googleapis.com/v1/places:autocomplete",{
-        method:"POST",
-        headers:{"Content-Type":"application/json","X-Goog-Api-Key":key},
-        body:JSON.stringify({input:q,includedPrimaryTypes:["establishment"]})
-      });
-      if(r.ok){
-        const d=await r.json();
-        const preds=(d.suggestions||[]).map(s=>s.placePrediction).filter(Boolean);
-        if(preds.length>0){setSuggestions(preds.slice(0,8));setSearching(false);return;}
-      }
-      // Fall back to legacy Places Autocomplete API
-      const legacy=await fetch(`https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(q)}&types=establishment&key=${key}`);
-      if(legacy.ok){
-        const ld=await legacy.json();
-        const mapped=(ld.predictions||[]).map(p=>({
-          placeId:p.place_id,
-          text:{text:p.description},
-          structuredFormat:{mainText:{text:p.structured_formatting?.main_text||p.description},secondaryText:{text:p.structured_formatting?.secondary_text||""}}
-        }));
-        setSuggestions(mapped.slice(0,8));
-      }else{setSuggestions([]);}
+      // Places API (New) autocomplete. (The legacy maps/api/place/autocomplete endpoint blocks browser requests via CORS.)
+      const ac=async(body)=>{
+        const r=await fetch("https://places.googleapis.com/v1/places:autocomplete",{
+          method:"POST",headers:{"Content-Type":"application/json","X-Goog-Api-Key":key},body:JSON.stringify(body)
+        });
+        const d=await r.json().catch(()=>({}));
+        if(!r.ok)throw new Error(d.error?.message||"Autocomplete failed ("+r.status+")");
+        return (d.suggestions||[]).map(s=>s.placePrediction).filter(Boolean);
+      };
+      let preds;
+      try{preds=await ac({input:q,includedPrimaryTypes:["establishment"]});}
+      catch(e){preds=await ac({input:q});}
+      if(debounceRef.lastQ===q)setSuggestions(preds.slice(0,8));
     }catch(e){
       console.error("Autocomplete error:",e);
       setSuggestions([]);
@@ -1469,6 +1511,7 @@ function QuickAuditPage({showToast,onSaveLead}){
     setSelected(null);
     setResult(null);
     clearTimeout(debounceRef.current);
+    debounceRef.lastQ=v;
     debounceRef.current=setTimeout(()=>searchPlaces(v),350);
   };
 
@@ -1904,7 +1947,9 @@ function QuickAuditPage({showToast,onSaveLead}){
                   rating:result.rating,reviewCount:result.reviewCount,pageSpeed:result.pageSpeed,photoCount:result.photoCount,hasHours:result.hasHours,
                   status:"new",notes:"",auditData:null,activity:[{type:"audit",text:"Saved from Quick Audit — live Google data",time:"Just now"}]};
                 onSaveLead(lead);}}>➕ Save Lead to CRM</button>
-              <button className="btn btn-secondary" style={{flex:1,justifyContent:"center"}} onClick={()=>showToast("📤 Share link copied!")}>📤 Share Report</button>
+              <button className="btn btn-secondary" style={{flex:1,justifyContent:"center"}} onClick={async()=>{
+                const txt=`${result.name} — Digital Presence Snapshot\nOverall grade: ${result.grade} (${pct}/100)\n${result.address}${result.phone?"\n"+result.phone:""}\n\n`+sections.map(s=>`${s.label}: ${s.grade} (${s.score}/100)`).join("\n")+`\n\nGoogle rating: ${result.rating||"—"} from ${result.reviewCount} reviews\nWebsite: ${result.website||"None found"}${result.pageSpeed!=null?"\nMobile PageSpeed: "+result.pageSpeed+"/100":""}\nGoogle Maps: ${result.mapsUrl}`;
+                showToast(await copyText(txt)?"📋 Report summary copied — paste it into an email or DM":"⚠️ Couldn't access clipboard");}}>📋 Copy Summary</button>
             </div>
           </div>
 
@@ -2025,8 +2070,7 @@ function AuditHistoryPage({showToast,onSaveLead}){
                         hasWeb:h.hasWeb,grade:h.grade,
                         seo:seoH,reviews:h.reviewScore,social:socialH,ws:h.wsScore,ads:h.hasWeb?30:10,listings:h.listingScore,ecom:h.hasWeb?20:0,tech:h.hasWeb?35:10,
                         rating:h.rating,reviewCount:h.reviewCount,pageSpeed:h.pageSpeed,photoCount:h.photoCount,hasHours:h.hasHours,
-                        status:"new",notes:"",auditData:null,activity:[{type:"audit",text:"Saved from Audit History — live Google data",time:"Just now"}]});
-                      showToast("✅ Saved to Contacts!");}}>+ CRM</button>
+                        status:"new",notes:"",auditData:null,activity:[{type:"audit",text:"Saved from Audit History — live Google data",time:"Just now"}]});}}>+ CRM</button>
                   </td>
                 </tr>
               ))}
@@ -2097,8 +2141,7 @@ function AuditHistoryPage({showToast,onSaveLead}){
                 hasWeb:r.hasWeb,grade:r.grade,
                 seo:seoR,reviews:r.reviewScore,social:socialR,ws:r.wsScore,ads:r.hasWeb?30:10,listings:r.listingScore,ecom:r.hasWeb?20:0,tech:r.hasWeb?35:10,
                 rating:r.rating,reviewCount:r.reviewCount,pageSpeed:r.pageSpeed,photoCount:r.photoCount,hasHours:r.hasHours,
-                status:"new",notes:"",auditData:null,activity:[{type:"audit",text:"Saved from Audit History — live Google data",time:"Just now"}]});
-              showToast("✅ Saved to Contacts!");}}>➕ Save to CRM</button>
+                status:"new",notes:"",auditData:null,activity:[{type:"audit",text:"Saved from Audit History — live Google data",time:"Just now"}]});}}>➕ Save to CRM</button>
           </div>
           );
         })()}
@@ -2166,7 +2209,7 @@ function SettingsPage({showToast}){
                   style={{border:"1px solid var(--border)",borderRadius:6,flex:1}}
                   placeholder={keys[f.key]?"••••••••••••":"Paste API key here..."}
                   defaultValue={keys[f.key]||""}
-                  onBlur={e=>{if(e.target.value&&e.target.value!=="••••••••••••")save(f.key,e.target.value);}}
+                  onBlur={e=>{const v=e.target.value.trim();if(v!==(keys[f.key]||""))save(f.key,v);}}
                 />
                 <button className="btn btn-secondary btn-sm" onClick={()=>setShow(s=>({...s,[f.key]:!s[f.key]}))} style={{flexShrink:0}}>
                   {show[f.key]?"🙈":"👁"}
@@ -2225,8 +2268,15 @@ function SettingsPage({showToast}){
 function App(){
   const [nav,setNav]=useState("contacts");
   const [contacts,setContacts]=useState(()=>{
-    try{const s=localStorage.getItem("geni_contacts");return s?JSON.parse(s):SEED;}catch{return SEED;}
+    try{const s=JSON.parse(localStorage.getItem("geni_contacts")||"null");return Array.isArray(s)?s.map(normalizeContact):SEED;}catch{return SEED;}
   });
+
+  // Lets other pages (e.g. the Quick Audit "Settings" link) switch tabs
+  useEffect(()=>{
+    const go=e=>{setActiveContact(null);setNav(e.detail);};
+    document.addEventListener("geni-nav",go);
+    return()=>document.removeEventListener("geni-nav",go);
+  },[]);
   const [activeContact,setActiveContact]=useState(null);
   const [toasts,setToasts]=useState([]);
   const toastRef=useRef({});
@@ -2254,13 +2304,26 @@ function App(){
     setActiveContact(null);
   },[]);
 
+  // Returns how many were actually added (duplicates by business name are skipped)
+  const contactsRef=useRef(contacts);
+  contactsRef.current=contacts;
   const importContacts=useCallback((rows)=>{
-    setContacts(cs=>{
-      const existing=new Set(cs.map(c=>c.biz?.toLowerCase()?.trim()));
-      const fresh=rows.filter(r=>!existing.has(r.biz?.toLowerCase()?.trim()));
-      return [...cs,...fresh];
-    });
+    const keyOf=c=>(c.biz||"").toLowerCase().trim();
+    const existing=new Set(contactsRef.current.map(keyOf));
+    const fresh=[];
+    for(const r of rows.map(normalizeContact)){
+      const k=keyOf(r);
+      if(existing.has(k))continue;
+      existing.add(k);fresh.push(r);
+    }
+    if(fresh.length)setContacts(cs=>[...cs,...fresh]);
+    return fresh.length;
   },[]);
+  const saveLead=(lead)=>{
+    const added=importContacts([lead]);
+    showToast(added?"✅ Lead saved to Contacts!":"ℹ️ "+lead.biz+" is already in Contacts");
+    setNav("contacts");
+  };
 
   const hotCount=contacts.filter(c=>c.grade==="F").length;
 
@@ -2397,8 +2460,8 @@ function App(){
                   </div>
                 </div>
               )}
-              {nav==="quickaudit"&&<QuickAuditPage showToast={showToast} onSaveLead={(lead)=>{importContacts([lead]);showToast("✅ Lead saved to Contacts!");setNav("contacts");}}/>}
-              {nav==="audithistory"&&<AuditHistoryPage showToast={showToast} onSaveLead={(lead)=>{importContacts([lead]);showToast("✅ Lead saved to Contacts!");setNav("contacts");}}/>}
+              {nav==="quickaudit"&&<QuickAuditPage showToast={showToast} onSaveLead={saveLead}/>}
+              {nav==="audithistory"&&<AuditHistoryPage showToast={showToast} onSaveLead={saveLead}/>}
               {nav==="settings"&&<SettingsPage showToast={showToast}/>}
             </div>
           </>
